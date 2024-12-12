@@ -1,3 +1,5 @@
+close all
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Crear figuras distintas para el láser y el visualizador del VFH
 % NOTA: para dibujar sobre una figura concreta, antes de llamar a la
@@ -7,11 +9,20 @@
 close all
 fig_laser=figure; title('LASER')
 fig_vfh=figure; title('VFH')
+fig_mapa=figure;
+
+%Definir la posicion de destino
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%startLocation = [0 0];
+endLocation = [-5 12];
+
+XnumNOdes = 200;
+Xmetros = 20;
 
 %Inicializar valores X, Y, Z
-umbralx=0
-umbraly=0
-umbralyaw=0
+umbralx=0.05
+umbraly=0.05
+umbralyaw=0.05
 
 %Cargar el mapa
 load mapa_pos_real_SLAMONLineRosbagPropioFINAL.mat
@@ -22,11 +33,11 @@ VFH=controllerVFH;
 
 % Ajustar propiedades del objeto VFH
 VFH.NumAngularSectors=180;
-VFH.DistanceLimits=[0.05 2];
+VFH.DistanceLimits=[0.05 1.5];
 VFH.RobotRadius=0.1;
 VFH.SafetyDistance=0.1;
 VFH.MinTurningRadius=0.1;
-VFH.TargetDirectionWeight=5;
+VFH.TargetDirectionWeight=50;
 VFH.CurrentDirectionWeight=2;
 VFH.PreviousDirectionWeight=2;
 VFH.HistogramThresholds=[3 10];
@@ -64,7 +75,12 @@ visualizationHelper = ExampleHelperAMCLVisualization(map);
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-
+%Crear el objeto PurePursuit y ajustar sus propiedades
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+controller=controllerPurePursuit;
+controller.LookaheadDistance =2
+controller.DesiredLinearVelocity=0.1
+controller.MaxAngularVelocity=0.3
 
 % Rellenar los campos por defecto de la velocidad del robot, para que la lineal
 %sea siempre 0.1 m/s
@@ -110,9 +126,9 @@ while(1)
     
     %Mostrar los datos por pantalla
     estimatedCovariance
-    estimatedCovariance(1,1)
-    estimatedCovariance(2,2)
-    estimatedCovariance(3,3)
+    xprint=estimatedCovariance(1,1)
+    yprint=estimatedCovariance(2,2)
+    orientprint=estimatedCovariance(3,3)
 
     % Drive robot to next pose.
     %wander(wanderHelper);
@@ -150,4 +166,94 @@ show(VFH);
 send(pub_vel, msg_vel);
 %Esperar al siguiente periodo de muestreo
 waitfor(r);
+end
+
+
+%%%%%%%%%%% AL SALIR DE ESTE BUCLE EL ROBOT YA SE HA LOCALIZADO %%%%%%%%%%
+%%%%%%%%%%% COMIENZA LA PLANIFICACIÓN GLOBAL %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Paramos el robot, para que no avance mientras planificamos
+msg_vel.linear.x=0;
+msg_vel.linear.y=0;
+msg_vel.linear.z=0;
+
+msg_vel.angular.x=0;
+msg_vel.angular.y=0;
+msg_vel.angular.z=0;
+%Publicar el mensaje de velocidad
+send(pub_vel, msg_vel);
+%Hacemos una copia del mapa, para “inflarlo” antes de planificar
+cpMap= copy(map);
+inflate(cpMap,0.25);
+%Crear el objeto PRM y ajustar sus parámetros
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+planner = mobileRobotPRM;
+planner.Map= cpMap;
+planner.NumNodes= 500;
+planner.ConnectionDistance = 3;
+%Obtener la ruta hacia el destino desde la posición actual del robot y mostrarla
+%en una figura
+startLocation = estimatedPose(1:2);
+
+ruta=findpath(planner,startLocation,endLocation);
+figure; 
+show(planner);
+
+%%%%%%%%%%% COMIENZA EL BUCLE DE CONTROL %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Indicamos al controlador la lista de waypoints a recorrer (ruta)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+controller.Waypoints=ruta
+%Bucle de control
+%%%%%%%%%%%%%%%%%
+while(1)
+%Leer el láser y la odometría
+    msg_laser = receive(sub_laser);
+    msg_odom = sub_odom.LatestMessage;
+
+    scans = rosReadLidarScan(msg_laser);  % Extraer datos del mensaje del laser
+    scans = removeInvalidData(scans, 'RangeLimits', [0, 11.5]);  % Quitar datos fuera de rango
+    scans = transformScan(scans, [0 0 giro_laser]);  % Girar datos laser si es necesario
+    
+%Obtener la posición pose=[x,y,yaw] a partir de la odometría anterior
+    odomQuat = [msg_odom.pose.pose.orientation.w, msg_odom.pose.pose.orientation.x, ...
+        msg_odom.pose.pose.orientation.y, msg_odom.pose.pose.orientation.z];
+    odomRotation = quat2eul(odomQuat);
+        % Establecer la pose actual [x, y, theta] del robot
+    pose_robot = [msg_odom.pose.pose.position.x msg_odom.pose.pose.position.y odomRotation(1)];
+
+%Ejecutar amcl para obtener la posición estimada estimatedPose
+    [isUpdated,estimatedPose, estimatedCovariance] = amcl(pose_robot, scans);
+
+
+    if isUpdated
+        i = i + 1
+        plotStep(visualizationHelper, amcl, estimatedPose, scans, i)
+    end
+    
+%Ejecutar el controlador PurePursuit para obtener las velocidades lineal
+%y angular
+
+[lin_vel,ang_vel]=controller(estimatedPose);
+%Rellenar los campos del mensaje de velocidad
+msg_vel.linear.x=lin_vel;
+
+steeringDir = VFH(scans, 0.75*ang_vel);
+v_ang = 0.35 * steeringDir;
+figure(fig_vfh);
+show(VFH);
+
+msg_vel.angular.z=v_ang;
+%Publicar el mensaje de velocidad
+send(pub_vel, msg_vel);
+
+%Comprobar si hemos llegado al destino, calculando la distancia euclidea
+%y estableciendo un umbral
+Goal=endLocation
+
+if (sqrt((Goal(1)-estimatedPose(1))^2+(Goal(2)-estimatedPose(2))^2) < 0.2)
+%Parar el robot
+break;
+end
+%Esperar al siguiente periodo de muestreo
+waitfor(r);
+
 end

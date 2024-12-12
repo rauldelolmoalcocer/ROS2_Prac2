@@ -8,6 +8,17 @@ close all
 fig_laser=figure; title('LASER')
 fig_vfh=figure; title('VFH')
 
+%Definir la posicion de destino
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%startLocation = [0 0];
+endLocation = [-5 12];
+XnumNOdes = 200;
+Xmetros = 20;
+
+%Inicializar valores X, Y, Z
+umbralx=0.0024
+umbraly=0.0027
+umbralyaw=0.0498
 
 %Cargar el mapa
 load mapa_pos_real_SLAMONLineRosbagPropioFINAL.mat
@@ -51,9 +62,10 @@ amcl.UpdateThresholds = [0.2,0.2,0.2];
 amcl.ResamplingInterval = 1;
 
 amcl.ParticleLimits = [500 50000];           % Minimum and maximum number of particles
-amcl.GlobalLocalization = true;      % global = true      local=false
-amcl.InitialPose = [0 0 0];              % Initial pose of vehicle   
-amcl.InitialCovariance = diag([1 1 1])*0.5; % Covariance of initial pose
+amcl.GlobalLocalization = false;      % global = true      local=false
+amcl.InitialPose = [4 2 0];              % Initial pose of vehicle   
+amcl.InitialCovariance = diag([1 1 1])*3; % Covariance of initial pose
+
 
 visualizationHelper = ExampleHelperAMCLVisualization(map);
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -72,14 +84,13 @@ msg_vel.angular.y=0;
 msg_vel.angular.z=0.1;
 %Bucle de control infinito
 while(1)
+    %Leer y dibujar los datos del láser en la figura ‘fig_laser’
+    msg_laser = sub_laser.LatestMessage;
+    scans= rosReadLidarScan(msg_laser); %Crear objeto lidarScan
+    figure(fig_laser);
+    plot(scans); %Visualizar datos del láser
 
-%Leer y dibujar los datos del láser en la figura ‘fig_laser’
-msg_laser = sub_laser.LatestMessage;
-scans= rosReadLidarScan(msg_laser); %Crear objeto lidarScan
-figure(fig_laser);
-plot(scans); %Visualizar datos del láser
-
-%Leer la odometría
+    %Leer la odometría
 
     % Receive laser scan and odometry message.
     msg_laser = receive(sub_laser);
@@ -104,11 +115,17 @@ plot(scans); %Visualizar datos del láser
     % sensor readings.
     [isUpdated,estimatedPose, estimatedCovariance] = amcl(pose_robot, scans);
     
+    %Mostrar los datos por pantalla
+    estimatedCovariance
+    xprint=estimatedCovariance(1,1)
+    yprint=estimatedCovariance(2,2)
+    orientprint=estimatedCovariance(3,3)
+
     % Drive robot to next pose.
     %wander(wanderHelper);
-if (estimatedCovariance(1,1)<umbralx && estimatedCovariance(2,2)<umbraly && estimatedCovariance(3,3)<umbralyaw) 
-  disp(‘Robot Localizado’); 
-  break; 
+    if (estimatedCovariance(1,1)<umbralx && estimatedCovariance(2,2)<umbraly && estimatedCovariance(3,3)<umbralyaw) 
+        disp("Robot Localizado");
+        break; 
     end
      %Dibujar los resultados del localizador con el visualizationHelper 
         % Plot the robot's estimated pose, particles and laser scans on the map.
@@ -141,3 +158,34 @@ send(pub_vel, msg_vel);
 %Esperar al siguiente periodo de muestreo
 waitfor(r);
 end
+
+
+%%%%%%%%%%% AL SALIR DE ESTE BUCLE EL ROBOT YA SE HA LOCALIZADO %%%%%%%%%%
+%%%%%%%%%%% COMIENZA LA PLANIFICACIÓN GLOBAL %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Paramos el robot, para que no avance mientras planificamos
+msg_vel.linear.x=0;
+msg_vel.linear.y=0;
+msg_vel.linear.z=0;
+
+msg_vel.angular.x=0;
+msg_vel.angular.y=0;
+msg_vel.angular.z=0;
+%Publicar el mensaje de velocidad
+send(pub_vel, msg_vel);
+%Hacemos una copia del mapa, para “inflarlo” antes de planificar
+cpMap= copy(map);
+inflate(cpMap,0.25);
+%Crear el objeto PRM y ajustar sus parámetros
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+planner = mobileRobotPRM;
+planner.Map= cpMap;
+planner.NumNodes= 500;
+planner.ConnectionDistance = 3;
+%Obtener la ruta hacia el destino desde la posición actual del robot y mostrarla
+%en una figura
+startLocation = estimatedPose(1:2);
+
+ruta=findpath(planner,startLocation,endLocation);
+figure; 
+show(planner);
+
